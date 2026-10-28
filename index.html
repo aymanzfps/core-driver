@@ -1,0 +1,403 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover" />
+<meta name="theme-color" content="#1b1033" />
+<title>Core Diver</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #1b1033; overflow: hidden; touch-action: none; user-select: none; -webkit-user-select: none; }
+  body { font-family: ui-rounded, "SF Pro Rounded", system-ui, sans-serif; color: #fff; }
+  body { display: flex; justify-content: center; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<script>
+"use strict";
+
+// ---------- Setup ----------
+const canvas = document.getElementById("game");
+const ctx = canvas.getContext("2d");
+const COLS = 9;
+let W, H, CELL, DPR;
+
+function resize() {
+  const oldW = W;
+  DPR = Math.min(window.devicePixelRatio || 1, 2);
+  H = window.innerHeight;
+  W = Math.min(window.innerWidth, H * 0.62); // phone-shaped play area on desktop
+  CELL = W / COLS;
+  canvas.width = W * DPR;
+  canvas.height = H * DPR;
+  canvas.style.width = W + "px";
+  canvas.style.height = H + "px";
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  // Keep the drill in the same column when the screen size changes.
+  if (oldW && drillX !== undefined) { drillX *= W / oldW; targetX *= W / oldW; }
+}
+window.addEventListener("resize", resize);
+resize();
+
+// ---------- Tuning ----------
+const COMBO_FOR_MOLTEN = 20;
+const MOLTEN_SECONDS = 3;
+const levelRows = (lvl) => 50 + lvl * 12;
+const levelSpeed = (lvl) => 6.5 + lvl * 0.6; // rows per second while drilling
+const bedrockChance = (lvl) => Math.min(0.08 + lvl * 0.025, 0.32);
+
+// Rock bands get warmer the deeper you go.
+const BANDS = [
+  ["#8bd450", "#6fb83a"], // topsoil
+  ["#f2b84b", "#d99a2b"],
+  ["#f07b3f", "#d35f25"],
+  ["#e8455a", "#c42c43"],
+  ["#b23cc4", "#8f25a0"],
+];
+const EMPTY = 0, ROCK = 1, GEM = 2, BEDROCK = 3, CORE = 4;
+
+// ---------- State ----------
+let grid, rows, level, score, best, combo, molten, drillX, targetX, depth, holding, state, shake, particles, floaters, lane, flash;
+best = Number(safeGet("coreDiver.best")) || 0;
+level = Number(safeGet("coreDiver.level")) || 1;
+
+function safeGet(k) { try { return localStorage.getItem(k); } catch { return null; } }
+function safeSet(k, v) { try { localStorage.setItem(k, v); } catch {} }
+
+function newLevel() {
+  rows = levelRows(level);
+  grid = [];
+  lane = Math.floor(COLS / 2);
+  for (let r = 0; r < rows + 6; r++) grid.push(makeRow(r));
+  drillX = targetX = (COLS / 2) * CELL;
+  depth = -2; // rows below the surface; drill starts above ground
+  combo = 0;
+  molten = 0;
+  particles = [];
+  floaters = [];
+  shake = 0;
+  flash = 0;
+}
+
+function makeRow(r) {
+  if (r >= rows) return new Array(COLS).fill(CORE);
+  // A safe lane wanders down the level so there's always a way through.
+  if (r % 3 === 0) lane = Math.max(1, Math.min(COLS - 2, lane + (Math.random() * 3 | 0) - 1));
+  const row = [];
+  for (let c = 0; c < COLS; c++) {
+    const nearLane = Math.abs(c - lane) <= 1;
+    const roll = Math.random();
+    if (r < 4) row.push(ROCK); // a calm start
+    else if (!nearLane && roll < bedrockChance(level)) row.push(BEDROCK);
+    else if (roll > 0.94) row.push(GEM);
+    else row.push(ROCK);
+  }
+  // Bedrock likes to clump into slabs, which reads better than confetti.
+  if (r > 4 && Math.random() < 0.18 + level * 0.02) {
+    const start = Math.random() * COLS | 0, len = 2 + (Math.random() * 3 | 0);
+    for (let c = start; c < start + len && c < COLS; c++) if (Math.abs(c - lane) > 1) row[c] = BEDROCK;
+  }
+  return row;
+}
+
+function startRun() {
+  score = 0;
+  newLevel();
+  state = "play";
+}
+
+// ---------- Input ----------
+let pointerId = null;
+function toLocalX(e) {
+  const rect = canvas.getBoundingClientRect();
+  return (e.clientX - rect.left) * (W / rect.width);
+}
+canvas.addEventListener("pointerdown", (e) => {
+  pointerId = e.pointerId;
+  try { canvas.setPointerCapture(e.pointerId); } catch {} // keep tracking a finger that slides off
+  if (state === "menu" || state === "over") return startRun();
+  if (state === "cleared") { level++; safeSet("coreDiver.level", level); newLevel(); state = "play"; return; }
+  holding = true;
+  targetX = toLocalX(e);
+});
+canvas.addEventListener("pointermove", (e) => {
+  if (e.pointerId === pointerId && holding) targetX = toLocalX(e);
+});
+const release = (e) => { if (e.pointerId === pointerId) { holding = false; if (!molten) combo = 0; } };
+canvas.addEventListener("pointerup", release);
+canvas.addEventListener("pointercancel", release);
+window.addEventListener("keydown", (e) => { if (e.code === "Space") canvas.dispatchEvent(new PointerEvent("pointerdown", { clientX: drillX, pointerId: 1 })); });
+window.addEventListener("keyup", (e) => { if (e.code === "Space") release({ pointerId: 1 }); });
+
+const buzz = (ms) => navigator.vibrate && navigator.vibrate(ms);
+
+// ---------- Update ----------
+const DRILL_W = 0.62; // in cells
+
+function update(dt) {
+  particles = particles.filter((p) => (p.life -= dt) > 0);
+  for (const p of particles) { p.x += p.vx * dt; p.y += p.vy * dt; p.vy += 900 * dt; p.rot += p.vr * dt; }
+  floaters = floaters.filter((f) => (f.life -= dt) > 0);
+  for (const f of floaters) f.y -= 40 * dt;
+  shake = Math.max(0, shake - dt * 30);
+  flash = Math.max(0, flash - dt * 3);
+  if (state !== "play") return;
+
+  if (molten > 0) { molten -= dt; if (molten <= 0) { molten = 0; combo = 0; } }
+
+  // Steer toward the finger, clamped inside the walls.
+  const half = (DRILL_W / 2) * CELL;
+  const prevX = drillX;
+  if (holding) drillX += (targetX - drillX) * Math.min(1, dt * 14);
+  drillX = Math.max(half, Math.min(W - half, drillX));
+  if (holding) depth += levelSpeed(level) * (molten ? 1.35 : 1) * dt;
+
+  // Break everything the drill body overlaps.
+  const left = drillX - half, right = drillX + half;
+  const c0 = Math.max(0, Math.floor(left / CELL)), c1 = Math.min(COLS - 1, Math.floor((right - 0.01) / CELL));
+  const rTip = Math.floor(depth + 0.15), rTop = Math.floor(depth - 0.7);
+  for (let r = Math.max(0, rTop); r <= rTip; r++) {
+    if (r >= grid.length) continue;
+    for (let c = c0; c <= c1; c++) {
+      const t = grid[r][c];
+      if (t === EMPTY) continue;
+      if (t === CORE) return clearLevel();
+      if (t === BEDROCK && !molten) return crash(c, r);
+      smash(c, r, t);
+    }
+  }
+}
+
+function smash(c, r, t) {
+  grid[r][c] = EMPTY;
+  combo++;
+  let pts = t === GEM ? 25 : t === BEDROCK ? 15 : 1;
+  if (combo >= 10) pts *= 2;
+  score += pts;
+  if (t === GEM) { floaters.push({ x: (c + 0.5) * CELL, y: rowToY(r), text: "+" + pts, life: 0.8 }); buzz(15); }
+  if (t === BEDROCK) shake = Math.max(shake, 6);
+  burst((c + 0.5) * CELL, rowToY(r) + CELL / 2, tileColor(t, r), t === GEM ? 14 : 7);
+  if (!molten && combo >= COMBO_FOR_MOLTEN) {
+    molten = MOLTEN_SECONDS;
+    flash = 1;
+    shake = 10;
+    floaters.push({ x: W / 2, y: H * 0.45, text: "MOLTEN!", life: 1.2, big: true });
+    buzz([30, 30, 60]);
+  }
+}
+
+function crash(c, r) {
+  state = "over";
+  shake = 18;
+  burst(drillX, rowToY(depth), "#ffffff", 30);
+  burst(drillX, rowToY(depth), "#9aa3b5", 30);
+  buzz(200);
+  if (score > best) { best = score; safeSet("coreDiver.best", best); }
+}
+
+function clearLevel() {
+  state = "cleared";
+  score += 100 * level;
+  if (score > best) { best = score; safeSet("coreDiver.best", best); }
+  for (let i = 0; i < 6; i++) burst(Math.random() * W, H * 0.5, ["#ffe66d", "#ff6b6b", "#4ecdc4"][i % 3], 20);
+  buzz([40, 40, 40, 40, 120]);
+}
+
+function burst(x, y, color, n) {
+  for (let i = 0; i < n; i++) {
+    const a = Math.random() * Math.PI * 2, s = 120 + Math.random() * 380;
+    particles.push({ x, y, vx: Math.cos(a) * s, vy: Math.sin(a) * s - 200, life: 0.5 + Math.random() * 0.5, color, size: 4 + Math.random() * 7, rot: 0, vr: (Math.random() - 0.5) * 20 });
+  }
+}
+
+// ---------- Draw ----------
+const DRILL_Y = () => H * 0.32; // where the drill tip sits on screen
+const rowToY = (r) => DRILL_Y() + (r - depth) * CELL;
+
+function tileColor(t, r) {
+  if (t === GEM) return "#5ef0ff";
+  if (t === BEDROCK) return "#22202b";
+  const band = BANDS[Math.min(BANDS.length - 1, Math.floor((r / rows) * BANDS.length))];
+  return band[(r + 0) % 2 === 0 ? 0 : 1];
+}
+
+function roundRect(x, y, w, h, rad) {
+  ctx.beginPath();
+  ctx.roundRect(x, y, w, h, rad);
+}
+
+function draw(time) {
+  ctx.save();
+  if (shake) ctx.translate((Math.random() - 0.5) * shake, (Math.random() - 0.5) * shake);
+
+  // Sky above ground, warm cave below.
+  const groundY = rowToY(0);
+  const sky = ctx.createLinearGradient(0, 0, 0, H);
+  sky.addColorStop(0, "#4ea8ff");
+  sky.addColorStop(1, "#9ed8ff");
+  ctx.fillStyle = sky;
+  ctx.fillRect(-20, -20, W + 40, Math.max(0, groundY) + 20);
+  ctx.fillStyle = "#2a1747";
+  ctx.fillRect(-20, Math.max(0, groundY), W + 40, H + 40);
+
+  if (grid) {
+    const first = Math.max(0, Math.floor(depth - DRILL_Y() / CELL) - 1);
+    const last = Math.min(grid.length - 1, first + Math.ceil(H / CELL) + 2);
+    for (let r = first; r <= last; r++) {
+      const y = rowToY(r);
+      for (let c = 0; c < COLS; c++) {
+        const t = grid[r][c];
+        if (t === EMPTY) continue;
+        const x = c * CELL, g = 2;
+        if (t === CORE) {
+          ctx.fillStyle = `hsl(${45 + Math.sin(time / 200 + c) * 10}, 100%, 60%)`;
+          roundRect(x + g, y + g, CELL - g * 2, CELL - g * 2, 8); ctx.fill();
+          continue;
+        }
+        ctx.fillStyle = t === GEM ? tileColor(ROCK, r) : tileColor(t, r);
+        if (t === BEDROCK && molten) ctx.fillStyle = "#5a2a1a";
+        roundRect(x + g, y + g, CELL - g * 2, CELL - g * 2, 8); ctx.fill();
+        ctx.fillStyle = "rgba(255,255,255,0.18)";
+        roundRect(x + g, y + g, CELL - g * 2, (CELL - g * 2) * 0.35, 8); ctx.fill();
+        if (t === BEDROCK) {
+          ctx.fillStyle = molten ? "#ff8a3d" : "#ff3b5c";
+          ctx.beginPath(); // a warning spike
+          ctx.moveTo(x + CELL / 2, y + CELL * 0.22);
+          ctx.lineTo(x + CELL * 0.7, y + CELL * 0.72);
+          ctx.lineTo(x + CELL * 0.3, y + CELL * 0.72);
+          ctx.fill();
+        }
+        if (t === GEM) {
+          const cx = x + CELL / 2, cy = y + CELL / 2, s = CELL * 0.26 * (1 + Math.sin(time / 180 + r) * 0.08);
+          ctx.fillStyle = "#5ef0ff";
+          ctx.beginPath(); ctx.moveTo(cx, cy - s); ctx.lineTo(cx + s, cy); ctx.lineTo(cx, cy + s); ctx.lineTo(cx - s, cy); ctx.fill();
+          ctx.fillStyle = "#ffffff"; ctx.fillRect(cx - s * 0.25, cy - s * 0.45, s * 0.3, s * 0.3);
+        }
+      }
+    }
+    if (state !== "over") drawDrill(time);
+  }
+
+  for (const p of particles) {
+    ctx.save(); ctx.translate(p.x, p.y); ctx.rotate(p.rot);
+    ctx.globalAlpha = Math.min(1, p.life * 2);
+    ctx.fillStyle = p.color; ctx.fillRect(-p.size / 2, -p.size / 2, p.size, p.size);
+    ctx.restore();
+  }
+  for (const f of floaters) {
+    ctx.globalAlpha = Math.min(1, f.life * 2);
+    ctx.fillStyle = f.big ? "#ffb347" : "#ffffff";
+    ctx.font = `900 ${f.big ? 44 : 22}px ui-rounded, system-ui`;
+    ctx.textAlign = "center";
+    ctx.fillText(f.text, f.x, f.y);
+    ctx.globalAlpha = 1;
+  }
+  ctx.restore();
+
+  if (flash) { ctx.fillStyle = `rgba(255,140,40,${flash * 0.35})`; ctx.fillRect(0, 0, W, H); }
+  drawHud();
+  drawOverlay(time);
+}
+
+function drawDrill(time) {
+  const tipY = DRILL_Y(), w = DRILL_W * CELL, x = drillX;
+  const bodyTop = tipY - CELL * 1.5;
+  ctx.save();
+  if (molten) { ctx.shadowColor = "#ff7b00"; ctx.shadowBlur = 25; }
+  // Body
+  ctx.fillStyle = molten ? "#ff9a3c" : "#ffd23f";
+  roundRect(x - w * 0.42, bodyTop, w * 0.84, CELL * 0.85, 6); ctx.fill();
+  // Spinning bit
+  const bitTop = bodyTop + CELL * 0.8;
+  ctx.fillStyle = molten ? "#ffe0b0" : "#dfe6f0";
+  ctx.beginPath(); ctx.moveTo(x - w / 2, bitTop); ctx.lineTo(x + w / 2, bitTop); ctx.lineTo(x, tipY); ctx.fill();
+  ctx.shadowBlur = 0;
+  ctx.strokeStyle = molten ? "#ff6a00" : "#8a94a6";
+  ctx.lineWidth = 3;
+  const spin = holding ? (time / 40) % 1 : 0;
+  for (let i = 0; i < 3; i++) {
+    const t = (i / 3 + spin) % 1, yy = bitTop + t * (tipY - bitTop), half = (w / 2) * (1 - t);
+    ctx.beginPath(); ctx.moveTo(x - half, yy); ctx.lineTo(x + half, yy + 5); ctx.stroke();
+  }
+  ctx.restore();
+}
+
+function drawHud() {
+  ctx.textAlign = "left";
+  ctx.fillStyle = "#fff";
+  ctx.font = "900 34px ui-rounded, system-ui";
+  ctx.fillText(state === "menu" ? "" : score, 16, 46);
+  ctx.textAlign = "right";
+  ctx.font = "800 15px ui-rounded, system-ui";
+  ctx.fillText("LEVEL " + level, W - 16, 32);
+  ctx.fillStyle = "rgba(255,255,255,0.7)";
+  ctx.fillText("BEST " + best, W - 16, 52);
+  if (state !== "play" || !grid) return;
+
+  // Depth progress
+  const p = Math.max(0, Math.min(1, depth / rows));
+  ctx.fillStyle = "rgba(0,0,0,0.3)";
+  roundRect(16, 64, W - 32, 8, 4); ctx.fill();
+  ctx.fillStyle = "#ffe66d";
+  roundRect(16, 64, (W - 32) * p, 8, 4); ctx.fill();
+
+  // Combo meter toward Molten
+  const m = molten ? molten / MOLTEN_SECONDS : Math.min(1, combo / COMBO_FOR_MOLTEN);
+  ctx.fillStyle = "rgba(0,0,0,0.3)";
+  roundRect(16, H - 30, W - 32, 12, 6); ctx.fill();
+  ctx.fillStyle = molten ? "#ff7b00" : "#ff6b9d";
+  roundRect(16, H - 30, Math.max(12, (W - 32) * m), 12, 6); ctx.fill();
+  ctx.textAlign = "center";
+  ctx.font = "800 12px ui-rounded, system-ui";
+  ctx.fillStyle = "#fff";
+  ctx.fillText(molten ? "MOLTEN" : combo >= 10 ? "x2 COMBO" : "HOLD TO BUILD COMBO", W / 2, H - 38);
+}
+
+function drawOverlay(time) {
+  if (state === "play") return;
+  ctx.fillStyle = "rgba(20,10,40,0.55)";
+  ctx.fillRect(0, 0, W, H);
+  ctx.textAlign = "center";
+  ctx.fillStyle = "#fff";
+  const pulse = 1 + Math.sin(time / 250) * 0.04;
+  const lines = {
+    menu: ["CORE DIVER", "Hold to drill · drag to steer", "Avoid the black bedrock"],
+    over: ["DRILL BROKEN", "Score " + score + (score >= best && score > 0 ? " · new best!" : ""), "Level " + level],
+    cleared: ["CORE REACHED!", "Score " + score, "Level " + (level + 1) + " is deeper"],
+  }[state];
+  ctx.font = "900 44px ui-rounded, system-ui";
+  ctx.fillText(lines[0], W / 2, H * 0.38);
+  ctx.font = "700 18px ui-rounded, system-ui";
+  ctx.fillStyle = "rgba(255,255,255,0.85)";
+  ctx.fillText(lines[1], W / 2, H * 0.38 + 40);
+  ctx.fillText(lines[2], W / 2, H * 0.38 + 66);
+  ctx.save();
+  ctx.translate(W / 2, H * 0.62);
+  ctx.scale(pulse, pulse);
+  ctx.fillStyle = "#ffe66d";
+  roundRect(-90, -28, 180, 56, 28); ctx.fill();
+  ctx.fillStyle = "#2a1747";
+  ctx.font = "900 22px ui-rounded, system-ui";
+  ctx.fillText(state === "cleared" ? "NEXT LEVEL" : state === "over" ? "RETRY" : "TAP TO PLAY", 0, 8);
+  ctx.restore();
+}
+
+// ---------- Loop ----------
+state = "menu";
+newLevel();
+let last = performance.now();
+function frame(now) {
+  const dt = Math.min(0.033, (now - last) / 1000);
+  last = now;
+  update(dt);
+  draw(now);
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+
+// Exposed for automated play-testing only.
+window.__coreDiver = { get state() { return state; }, get score() { return score; }, get depth() { return depth; }, get rows() { return rows; } };
+</script>
+</body>
+</html>
